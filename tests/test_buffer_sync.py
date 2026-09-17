@@ -63,7 +63,7 @@ def run_case(manager, weights, grads, args, operation):
             hot = domain_base + layer
             # Rotate the delayed PE, exercising both remote producers and
             # consumers. This is GPU work, so it also applies during replay.
-            if local_rank == step % domain:
+            if local_rank == (step // 2) % domain:
                 torch.cuda._sleep(args.skew_cycles)
             value = step + 1
             if operation == "weight_sync":
@@ -132,6 +132,9 @@ def main():
     parser.add_argument("--sync", action="store_true")
     parser.add_argument("--non-deterministic", action="store_true")
     parser.add_argument(
+        "--operation", choices=("both", "weight_sync", "grad_reduce"), default="both"
+    )
+    parser.add_argument(
         "--plan-mode", choices=("direct", "force_relay"), default="direct"
     )
     parser.add_argument("--iterations", type=int, default=100)
@@ -176,7 +179,8 @@ def main():
                 [grads[layer][1]],
             )
         for operation in ("weight_sync", "grad_reduce"):
-            run_case(manager, weights, grads, args, operation)
+            if args.operation in ("both", operation):
+                run_case(manager, weights, grads, args, operation)
     finally:
         manager.destroy()
         dist.destroy_process_group()
