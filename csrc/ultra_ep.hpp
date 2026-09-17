@@ -13,7 +13,6 @@
 #include "runtime.hpp"
 #include "utils/event.hpp"
 #include "utils/exception.cuh"
-#include "utils/nvshmem.cuh"
 #include "utils/utils.hpp"
 
 namespace ultra_ep {
@@ -115,7 +114,8 @@ class Manager {
     // Placement buffers are device-resident; legacy placement owns any CPU staging internally.
     GlobalExpertPlacement placement;
 
-    // After NVSHMEM synchronization, this flag will be true
+    // After external symmetric buffers and device workspaces are initialized,
+    // this flag will be true.
     bool _available = false;
 
     // Destructor settings
@@ -129,8 +129,9 @@ class Manager {
     std::vector<std::optional<EventHandle>> placement_ready_events_;
     std::vector<int64_t> placement_ready_stream_ids_;
 
-    // Device-side local replica weight data/scale and grad buffers, shared by layers.
-    // Allocated via NVSHMEM symmetric heap for cross-GPU access.
+    // Device-side local replica weight data/scale and grad buffers, shared by
+    // layers.  The backing allocations are owned by Python's Symmetric Memory
+    // tensors; these Tensor members keep them alive for the C++ manager.
     void* local_replica_weight_buffer = nullptr;
     void* local_replica_weight_scale_buffer = nullptr;
     void* local_replica_grad_buffer = nullptr;
@@ -144,7 +145,8 @@ class Manager {
     torch::Tensor local_replica_fc1_grad_buffer_tensor;
     torch::Tensor local_replica_fc2_grad_buffer_tensor;
 
-    // Host-side remote memory pointers obtained via nvshmem_ptr() for NVL ranks
+    // Host-side remote memory pointers obtained from Symmetric Memory handles
+    // for NVLink-domain-local ranks.
     // Shape: [num_nvl_ranks,]
     void* global_replica_weight_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
     void* global_replica_weight_scale_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
@@ -199,10 +201,11 @@ class Manager {
     int weight_sync_relay_min_replicas_ = 6;
     int weight_sync_relay_max_relays_ = 8;
     int weight_sync_relay_min_fanout_gain_ = 2;
-    // Shape: [num_global_logical_experts]
-    int* global_logical_expert_loads = nullptr;  // alloc by nvshmem for allreduce
-    int32_t* local_expert_loads = nullptr;       // [L] — symmetric source buffer for allgather
-    int32_t* expert_loads_per_rank = nullptr;    // [num_ranks, L] — symmetric allgather output
+    // Placement metadata is ordinary CUDA memory.  Python runs the distributed
+    // collective into expert_loads_per_rank; C++ performs the reduction/solve.
+    torch::Tensor global_logical_expert_loads_tensor;  // [L]
+    torch::Tensor local_expert_loads_tensor;           // [L]
+    torch::Tensor expert_loads_per_rank_tensor;        // [num_ranks, L]
 
     int placement_sync_slot(const int layer_id) const { return is_train ? layer_id : 0; }
     void record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream);
@@ -234,7 +237,15 @@ public:
             const int& weight_sync_plan_mode = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
             const int& weight_sync_relay_min_replicas = 4,
             const int& weight_sync_relay_max_relays = 8,
-            const int& weight_sync_relay_min_fanout_gain = 2);
+            const int& weight_sync_relay_min_fanout_gain = 2,
+            const torch::Tensor& local_replica_weight_buffer_external = torch::Tensor(),
+            const torch::Tensor& local_replica_weight_scale_buffer_external = torch::Tensor(),
+            const torch::Tensor& local_weight_sync_ready_flags_external = torch::Tensor(),
+            const torch::Tensor& local_replica_grad_buffer_external = torch::Tensor(),
+            const torch::Tensor& remote_weight_ptrs_external = torch::Tensor(),
+            const torch::Tensor& remote_weight_scale_ptrs_external = torch::Tensor(),
+            const torch::Tensor& remote_grad_ptrs_external = torch::Tensor(),
+            const torch::Tensor& remote_ready_ptrs_external = torch::Tensor());
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
@@ -248,7 +259,8 @@ public:
                                            torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                            torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
-                                           bool async);
+                                           bool async,
+                                           bool use_current_stream);
     // Sync replica weights with masters
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
@@ -261,13 +273,12 @@ public:
                                            std::optional<EventHandle>& previous_event,
                                            bool async);
 
-    // Update expert placement for a single layer based on real-time load statistics.
-    // routing_map: [num_tokens, num_global_logical_experts], bool, logical routing map.
-    // Uses the default device placement path unless legacy placement is enabled.
-    void update_placement(const int& layer_id, torch::Tensor& routing_map);
-
-    // Sparse variant: compute expert loads from topk_ids [T, K] int64 instead of dense routing_map.
-    void update_placement_sparse(const int& layer_id, torch::Tensor& topk_ids);
+    // Placement is split around the Python torch.distributed collective:
+    //   compute_*_local_loads -> all_reduce/all_gather -> solve_placement.
+    void compute_local_loads(torch::Tensor& routing_map);
+    void compute_local_loads_sparse(torch::Tensor& topk_ids);
+    void solve_placement(const int& layer_id, torch::Tensor& expert_loads_per_rank);
+    void solve_placement_legacy(const int& layer_id, torch::Tensor& global_loads);
 
     // In-place remap topk_ids from logical to physical expert IDs using current placement.
     // topk_ids: [T, K] int64, modified in-place on GPU.
@@ -318,11 +329,13 @@ public:
     torch::Tensor get_logical_instance_quota_prefix_tensor() const { return placement.logical_instance_quota_prefix; }
     torch::Tensor get_rank_quota_prefix_tensor() const { return placement.rank_quota_prefix; }
     torch::Tensor get_global_logical_expert_loads_tensor() const {
-        return make_tensor_from_buffer(global_logical_expert_loads,
-                                       {num_global_logical_experts},
-                                       torch::kInt32,
-                                       torch::Device(torch::kCUDA, runtime::device_id));
+        return global_logical_expert_loads_tensor;
     };
+
+    torch::Tensor get_local_expert_loads_tensor() const { return local_expert_loads_tensor; }
+    torch::Tensor get_expert_loads_per_rank_tensor() const { return expert_loads_per_rank_tensor; }
+
+
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -352,7 +365,15 @@ static void register_apis(pybind11::module_& m) {
                             int,
                             int,
                             int,
-                            int>(),
+                            int,
+                            torch::Tensor,
+                            torch::Tensor,
+                            torch::Tensor,
+                            torch::Tensor,
+                            torch::Tensor,
+                            torch::Tensor,
+                            torch::Tensor,
+                            torch::Tensor>(),
              pybind11::arg("num_layers"),
              pybind11::arg("num_local_master_experts"),
              pybind11::arg("num_local_redundant_experts"),
@@ -378,11 +399,21 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("weight_sync_plan_mode") = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
              pybind11::arg("weight_sync_relay_min_replicas") = 4,
              pybind11::arg("weight_sync_relay_max_relays") = 8,
-             pybind11::arg("weight_sync_relay_min_fanout_gain") = 2)
+             pybind11::arg("weight_sync_relay_min_fanout_gain") = 2,
+             pybind11::arg("local_replica_weight_buffer_external") = torch::Tensor(),
+             pybind11::arg("local_replica_weight_scale_buffer_external") = torch::Tensor(),
+             pybind11::arg("local_weight_sync_ready_flags_external") = torch::Tensor(),
+             pybind11::arg("local_replica_grad_buffer_external") = torch::Tensor(),
+             pybind11::arg("remote_weight_ptrs_external") = torch::Tensor(),
+             pybind11::arg("remote_weight_scale_ptrs_external") = torch::Tensor(),
+             pybind11::arg("remote_grad_ptrs_external") = torch::Tensor(),
+             pybind11::arg("remote_ready_ptrs_external") = torch::Tensor())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
-        .def("update_placement", &Manager::update_placement)
-        .def("update_placement_sparse", &Manager::update_placement_sparse)
+        .def("compute_local_loads", &Manager::compute_local_loads)
+        .def("compute_local_loads_sparse", &Manager::compute_local_loads_sparse)
+        .def("solve_placement", &Manager::solve_placement)
+        .def("solve_placement_legacy", &Manager::solve_placement_legacy)
         .def("reroute_sparse", &Manager::reroute_sparse)
         .def("dense_reroute_forward", &Manager::dense_reroute_forward)
         .def("dense_reroute_backward", &Manager::dense_reroute_backward)
@@ -392,7 +423,8 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("local_master_fc1_grad_ptr_tensor"),
              pybind11::arg("local_master_fc2_grad_ptr_tensor"),
              pybind11::arg("previous_event"),
-             pybind11::arg("async_finish"))
+             pybind11::arg("async_finish"),
+             pybind11::arg("use_current_stream") = false)
         .def("weight_sync",
              &Manager::weight_sync,
              pybind11::arg("layer_id"),
@@ -422,7 +454,9 @@ static void register_apis(pybind11::module_& m) {
         .def("get_logical_instance_quota_tensor", &Manager::get_logical_instance_quota_tensor)
         .def("get_logical_instance_quota_prefix_tensor", &Manager::get_logical_instance_quota_prefix_tensor)
         .def("get_rank_quota_prefix_tensor", &Manager::get_rank_quota_prefix_tensor)
-        .def("get_global_logical_expert_loads_tensor", &Manager::get_global_logical_expert_loads_tensor);
+        .def("get_global_logical_expert_loads_tensor", &Manager::get_global_logical_expert_loads_tensor)
+        .def("get_local_expert_loads_tensor", &Manager::get_local_expert_loads_tensor)
+        .def("get_expert_loads_per_rank_tensor", &Manager::get_expert_loads_per_rank_tensor);
 
     m.def(
         "solve_placement_for_test",

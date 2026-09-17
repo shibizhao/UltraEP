@@ -6,7 +6,6 @@
 
 #include "kernels/config.cuh"
 #include "utils/exception.cuh"
-#include "utils/nvshmem.cuh"
 
 namespace ultra_ep::runtime {
 
@@ -18,12 +17,8 @@ extern int device_id, num_device_sms;
 
 at::cuda::CUDAStream get_global_comm_stream();
 
-pybind11::bytes get_local_nvshmem_unique_id(const int& rank);
-
 void init_runtime(const int& rank_idx_,
-                  const int& num_ranks_,
-                  const int& max_nvl_peers_,
-                  const pybind11::bytes& root_unique_id);
+                  const int& num_ranks_, const int& num_nvl_ranks_);
 
 void destroy();
 

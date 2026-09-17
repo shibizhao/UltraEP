@@ -3,21 +3,12 @@ import re
 import os
 import subprocess
 import setuptools
-import importlib
 
 from pathlib import Path
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-
-
-# Wheel specific: the wheels only include the SO name of the host library `libnvshmem_host.so.X`
-def get_nvshmem_host_lib_name(base_dir):
-    path = Path(base_dir).joinpath("lib")
-    for file in path.rglob("libnvshmem_host.so.*"):
-        return file.name
-    raise ModuleNotFoundError("libnvshmem_host.so not found")
 
 
 def get_package_version():
@@ -52,24 +43,6 @@ def find_cpp_cuda_sources(root_dir="csrc"):
 
 
 if __name__ == "__main__":
-    nvshmem_dir = os.getenv("NVSHMEM_DIR", None)
-    nvshmem_host_lib = "libnvshmem_host.so"
-    if nvshmem_dir is None:
-        spec = importlib.util.find_spec("nvidia.nvshmem")
-        if spec is None:
-            raise SystemExit(
-                "Unable to locate the nvidia.nvshmem package. "
-                "Install nvidia-nvshmem-cu12/13 or set NVSHMEM_DIR explicitly."
-            )
-        nvshmem_dir = spec.submodule_search_locations[0]
-        nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
-        import nvidia.nvshmem as nvshmem  # noqa: F401
-    elif not os.path.exists(Path(nvshmem_dir) / "lib" / nvshmem_host_lib):
-        nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
-    assert os.path.exists(
-        nvshmem_dir
-    ), f"The specified NVSHMEM directory does not exist: {nvshmem_dir}"
-
     cxx_flags = [
         "-O3",
         "-Wno-deprecated-declarations",
@@ -83,22 +56,7 @@ if __name__ == "__main__":
     sources = find_cpp_cuda_sources("csrc")
     include_dirs = ["csrc/"]
     library_dirs = []
-    nvcc_dlink = []
-    extra_link_args = []
-
-    # NVSHMEM flags
-    include_dirs.extend([f"{nvshmem_dir}/include"])
-    library_dirs.extend([f"{nvshmem_dir}/lib"])
-    nvcc_dlink.extend(["-dlink", f"-L{nvshmem_dir}/lib", "-lnvshmem_device"])
-    extra_link_args.extend(
-        [
-            "-lcuda",
-            f"-l:{nvshmem_host_lib}",
-            "-l:libnvshmem_device.a",
-            f"-Wl,-rpath,{nvshmem_dir}/lib",
-            "-Wl,--allow-multiple-definition",
-        ]
-    )
+    extra_link_args = ["-lcuda"]
 
     # Auto-detect CUDA arch if not explicitly set
     if "TORCH_CUDA_ARCH_LIST" not in os.environ:
@@ -121,8 +79,7 @@ if __name__ == "__main__":
                 "Set TORCH_CUDA_ARCH_LIST manually to override."
             )
 
-    # Device linking against NVSHMEM and multiple CUDA translation units requires RDC.
-    nvcc_flags.extend(["-rdc=true", "--ptxas-options=--register-usage-level=10"])
+    nvcc_flags.extend(["--ptxas-options=--register-usage-level=10"])
     # Compilation workaround for CUDA 13.x
     if torch.version.cuda and torch.version.cuda.startswith("13."):
         include_dirs.extend(["/usr/local/cuda/include/cccl/"])
@@ -137,9 +94,6 @@ if __name__ == "__main__":
         "cxx": cxx_flags,
         "nvcc": nvcc_flags,
     }
-    if len(nvcc_dlink) > 0:
-        extra_compile_args["nvcc_dlink"] = nvcc_dlink
-
     # Summary
     print("Build summary:")
     print(f" > Sources: {sources}")
@@ -148,7 +102,6 @@ if __name__ == "__main__":
     print(f" > Compilation flags: {extra_compile_args}")
     print(f" > Link flags: {extra_link_args}")
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
-    print(f" > NVSHMEM path: {nvshmem_dir}")
     print()
 
     setuptools.setup(

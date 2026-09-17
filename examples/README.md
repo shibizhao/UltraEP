@@ -16,8 +16,8 @@ docker run --gpus all -it --rm \
     -e TORCH_CUDA_ARCH_LIST= \
     nvcr.io/nvidia/pytorch:25.10-py3
 
-# Install NVSHMEM
-pip install "nvidia-nvshmem-cu13==3.4.5"
+# UltraEP uses PyTorch Symmetric Memory; no NVSHMEM wheel is required.
+# Make sure this image's PyTorch exposes torch.distributed._symmetric_memory.
 ```
 
 Clone and install UltraEP.

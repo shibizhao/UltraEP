@@ -1,60 +1,86 @@
 import os
-import torch.distributed as dist
-from .util import print_rank_0
 
-# noinspection PyUnresolvedReferences
+import torch
+import torch.distributed as dist
+
+from .symmetric_memory import set_cuda_backend_once
+from .util import print_rank_0
 import ultra_ep._C as _C
 
 _group = None
+_symmetric_group = None
 _nvl_domain_size = None
+_manager_count = 0
+_symmetric_groups = {}
 
 
 def init_runtime(group: dist.ProcessGroup):
-    global _group, _nvl_domain_size
+    """Keep placement on the EP group and peer mappings within each NVLink domain.
+
+    Equally sized domains occupy contiguous blocks of EP-group ranks.
+    MAX_NUM_NVL_PEERS can restrict the detected domain size. All EP ranks must
+    construct and destroy managers in the same order.
+    """
+    global _group, _symmetric_group, _nvl_domain_size, _manager_count
     if _C.is_runtime_initialized():
-        assert group == _group, "All EP buffers should share the same process group"
+        if group != _group:
+            raise ValueError("All live UltraEP managers must share the same EP group")
         return _nvl_domain_size
+    if group is None or group.size() <= 0 or group.rank() < 0:
+        raise ValueError("UltraEP requires membership in a non-empty EP process group")
 
-    # * IMPORTANT: NVSHMEM environment variables
-    # Disable NVLink SHArP to avoid cuMemMap failure
-    os.environ["NVSHMEM_DISABLE_NVLS"] = "1"
-    # NOTES: NVSHMEM initialization requires at least 256 MiB
-    os.environ["NVSHMEM_CUMEM_GRANULARITY"] = f"{2 ** 29}"
-    # Use primitive NVSHMEM for low-latency expert load all-reduce
-    os.environ.setdefault("NVSHMEM_DISABLE_NCCL", "1")
-
-    # Synchronize NVSHMEM unique IDs
-    root_unique_id = None
-    if group.rank() == 0:
-        root_unique_id = _C.get_local_nvshmem_unique_id(group.rank())
-    nvshmem_unique_ids = [None] * group.size()
-    dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
-    root_unique_id = nvshmem_unique_ids[0]
-
-    # Support both MNNVL and RDMA by setting MAX_NVL_PEERS
-    _ipc_manager = _C.IpcManager()
-    print_rank_0(f"[INFO] Use MNNVL fabric: {_ipc_manager.is_fabric_supported()}")
-    detected_ranks = _ipc_manager.detect_accessible_ranks(group)
-    del _ipc_manager
-
-    max_nvl_peers = os.getenv("MAX_NUM_NVL_PEERS")
-    if max_nvl_peers is not None:
-        max_nvl_peers = int(max_nvl_peers)
-        if max_nvl_peers != detected_ranks:
-            print_rank_0(
-                f"[WARN] MAX_NUM_NVL_PEERS={max_nvl_peers} differs from detected value {detected_ranks}. Using environment variable."
-            )
-    else:
-        max_nvl_peers = detected_ranks
-        print_rank_0(
-            f"[WARN] MAX_NUM_NVL_PEERS is not set. Using detected value {detected_ranks}."
+    backend = set_cuda_backend_once()
+    ipc_manager = _C.IpcManager()
+    detected = ipc_manager.detect_accessible_ranks(group)
+    del ipc_manager
+    domain_size = int(os.getenv("MAX_NUM_NVL_PEERS", detected))
+    if domain_size <= 0 or domain_size > detected or group.size() % domain_size:
+        raise ValueError(
+            f"MAX_NUM_NVL_PEERS={domain_size} must divide EP size {group.size()} "
+            f"and be between 1 and the detected peer count {detected}"
         )
 
-    # Initialize CPP runtime with NVSHMEM
-    _C.init_runtime(group.rank(), group.size(), max_nvl_peers, root_unique_id)
-
-    # Remember the EP group, which can not be changed anymore
+    ranks = dist.get_process_group_ranks(group)
+    first = group.rank() // domain_size * domain_size
+    # The NCCL symmetric allocator needs an eagerly initialized communicator.
+    # This also supports callers whose EP process group is initialized lazily.
+    key = (group, domain_size)
+    symmetric_group = _symmetric_groups.get(key)
+    if symmetric_group is None:
+        symmetric_group = dist.new_group(
+            ranks=ranks[first : first + domain_size],
+            backend="nccl",
+            use_local_synchronization=True,
+            device_id=torch.device("cuda", torch.cuda.current_device()),
+        )
+        # Keep domain communicators until torch.distributed's global teardown.
+        # Recreating a local-synchronization group with the same rank hash can
+        # reuse stale NCCL bootstrap keys in the store after group destruction.
+        # Managers still release every symmetric allocation on destroy().
+        _symmetric_groups[key] = symmetric_group
+    _C.init_runtime(group.rank(), group.size(), domain_size)
     _group = group
-    _nvl_domain_size = max_nvl_peers
+    _symmetric_group = symmetric_group
+    _nvl_domain_size = domain_size
+    print_rank_0(
+        f"UltraEP: Torch symmetric memory backend={backend}, NVLink domain size={domain_size}"
+    )
+    return domain_size
 
-    return max_nvl_peers
+
+def get_symmetric_group():
+    return _symmetric_group
+
+
+def retain_runtime():
+    global _manager_count
+    _manager_count += 1
+
+
+def release_runtime():
+    """Reset native topology after the last manager releases its allocations."""
+    global _group, _symmetric_group, _nvl_domain_size, _manager_count
+    _manager_count -= 1
+    if _manager_count == 0:
+        _C.destroy_runtime()
+        _group = _symmetric_group = _nvl_domain_size = None

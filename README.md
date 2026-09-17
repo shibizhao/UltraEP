@@ -38,20 +38,25 @@ The requirements are:
 - CUDA Toolkit:
     - CUDA 12.3 or higher for SM90
     - CUDA 12.9 or higher for SM100
-- NVLink for intra-node expert replication
-
-NVSHMEM is the only dependency (will switch to the more lightweight [NCCL GIN](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/deviceapi.html) in future). Install the runtime wheel and UltraEP can locate it automatically:
-
-```bash
-pip install "nvidia-nvshmem-cu13==3.4.5"
-# or nvidia-nvshmem-cu12==3.4.5 for CUDA 12.x
-```
+- NVLink/P2P access among the GPUs within each NVLink domain
+- A PyTorch build exposing `torch.distributed._symmetric_memory` with either
+  the CUDA or NCCL Symmetric Memory allocator enabled. UltraEP prefers CUDA and
+  falls back to the Symmetric Memory NCCL allocator when a build does not
+  register the CUDA allocator; neither path depends on NVSHMEM
 
 Then build and install. The builder can auto-detect CUDA compute capability; if failed, explicitly set `TORCH_CUDA_ARCH_LIST` to `9.0` (SM90) or `10.0` (SM100).
 
 ```bash
 python setup.py install
 ```
+
+UltraEP does not link against or initialize NVSHMEM. At manager construction,
+the Python layer allocates the replica buffers with PyTorch Symmetric Memory,
+rendezvouses them within each detected NVLink domain, and passes the resulting
+peer-pointer tables to the CUDA extension. Placement collectives still span
+the full EP process group. As before, equally sized NVLink domains must occupy
+contiguous EP-rank blocks; `MAX_NUM_NVL_PEERS` can restrict the detected size.
+For an NVL72 host with EP16, pass the EP process group of size 16.
 
 You're all set! Simply import `ultra_ep` in your Python project and get started.
 
@@ -153,7 +158,7 @@ def transformer_layer(hidden, manager, layer_id):
 
 ## Tests
 
-UltraEP provides two test entrypoints. `test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.
+`test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.
 
 ```bash
 # Single-GPU placement/reroute simulation
@@ -166,7 +171,17 @@ torchrun --nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK
     tests/test_e2e.py --num-experts 256
 ```
 
-The table below reports one EP64, 256-expert `test_e2e.py` run (4 master + 2 redundant experts/rank, topk = 8, tokens/rank = 8k, bf16 weights, 42 SMs for grad-reduce). The 1.01 final imbalance corresponds to the default balancing tolerance (`ULTRA_EP_QUOTA_ORACLE_EPS=0.01`):
+Symmetric-memory and synchronization regressions can be run on two or four GPUs:
+
+```bash
+torchrun --standalone --nproc_per_node=2 tests/test_buffer_sync.py --graph
+torchrun --standalone --nproc_per_node=2 tests/test_buffer_sync.py --sync --non-deterministic
+torchrun --standalone --nproc_per_node=2 tests/test_buffer_sync.py --graph --previous-event --current-stream
+torchrun --standalone --nproc_per_node=4 tests/test_symmetric_memory.py --subgroups
+MAX_NUM_NVL_PEERS=2 torchrun --standalone --nproc_per_node=4 tests/test_symmetric_memory.py
+```
+
+The table below reports an original NVSHMEM-based EP64, 256-expert `test_e2e.py` run (4 master + 2 redundant experts/rank, topk = 8, tokens/rank = 8k, bf16 weights, 42 SMs for grad-reduce). The 1.01 final imbalance corresponds to the default balancing tolerance (`ULTRA_EP_QUOTA_ORACLE_EPS=0.01`):
 
 | Initial imbalance (max/mean) | **1.51** | **2.01** | **3.03** |
 | :--- | :---: | :---: | :---: |
@@ -202,9 +217,34 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 - `ULTRA_EP_QUOTA_KERNEL_STAGE` (default `1`): quota kernel stage (`0` or `1`).
 - `ULTRA_EP_QUOTA_REROUTE_INTERLEAVE` (default `1`): interleave token order to avoid congestion in subsequent dispatch.
 
-**NVSHMEM**
+**Symmetric Memory and placement metadata**
 
-- `NVSHMEM_DISABLE_NCCL` (default `1`): controls the backend for UltraEP's small global-load metadata all-gather before planning. With `1`, UltraEP uses NVSHMEM-native collectives, which appears faster in larger NVLink domain. On 8-GPU RDMA clusters where the EP group spans nodes, NCCL can be faster; set to `0` and benchmark both settings.
+- `torch.distributed._symmetric_memory.set_backend("CUDA")` is selected once
+  before the first replica-buffer allocation, with a fallback to the
+  Symmetric Memory `"NCCL"` allocator for PyTorch builds where the CUDA
+  allocator is not registered. Set `ULTRA_EP_SYMMETRIC_MEMORY_BACKEND` to
+  `CUDA` or `NCCL` to make the choice explicit. The `empty`/`rendezvous` calls
+  are initialization-time collectives and must occur in the same order on every
+  EP rank. UltraEP creates an eagerly initialized NCCL subgroup for each
+  NVLink domain, including when the caller supplies a lazily initialized group.
+- Replica weights, gradients, and relay flags use Symmetric Memory; C++ keeps
+  only tensor views and device-side peer-pointer tables. Python owns the
+  handles and allocation lifetime.
+- Placement metadata uses ordinary CUDA tensors. Each rank computes local
+  expert loads, then the EP group runs `dist.all_reduce` (legacy mode) or
+  `dist.all_gather_into_tensor` (quota mode), all on UltraEP's communication
+  stream before the placement solver is launched.
+- Weight-sync and grad-reduce always issue stream-ordered Symmetric Memory
+  barriers before and after remote buffer access. All ranks in each domain,
+  including ranks without local tasks, must call in the same order. The returned
+  event (or caller-stream wait) includes incoming writes and remote reads/clears.
+  These barriers support CUDA graph capture. Relay graph replay retains the
+  existing host-epoch limitation; use direct mode for captured weight-sync.
+- Call `manager.destroy()` collectively before destroying the EP process group.
+  Release captured graphs and user-held replica-buffer views first. Multiple
+  managers can share an EP group. Buffers are released by `destroy()`; domain
+  communicators are reused across managers and released by the final global
+  `torch.distributed.destroy_process_group()` call.
 
 ### Load profiler and viewer
 

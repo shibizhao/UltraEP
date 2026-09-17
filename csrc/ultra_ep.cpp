@@ -216,7 +216,15 @@ Manager::Manager(const int& num_layers,
                  const int& weight_sync_plan_mode,
                  const int& weight_sync_relay_min_replicas,
                  const int& weight_sync_relay_max_relays,
-                 const int& weight_sync_relay_min_fanout_gain)
+                 const int& weight_sync_relay_min_fanout_gain,
+                 const torch::Tensor& local_replica_weight_buffer_external,
+                 const torch::Tensor& local_replica_weight_scale_buffer_external,
+                 const torch::Tensor& local_weight_sync_ready_flags_external,
+                 const torch::Tensor& local_replica_grad_buffer_external,
+                 const torch::Tensor& remote_weight_ptrs_external,
+                 const torch::Tensor& remote_weight_scale_ptrs_external,
+                 const torch::Tensor& remote_grad_ptrs_external,
+                 const torch::Tensor& remote_ready_ptrs_external)
     : num_layers(num_layers),
       num_local_master_experts(num_local_master_experts),
       num_local_redundant_experts(num_local_redundant_experts),
@@ -303,57 +311,43 @@ Manager::Manager(const int& num_layers,
                    num_ranks,  // max_replicas_dim = num_ranks
                    device_id);
 
-    // Allocate local replica weight data buffer via NVSHMEM symmetric heap.
-    // This enables automatic cross-GPU access within NVL domain.
-    const int64_t local_replica_weight_bytes = static_cast<int64_t>(num_local_redundant_experts) *
-        checked_num_bytes(expert_total_numel, weight_data_element_bytes);
-
-    local_replica_weight_buffer = nvshmem::alloc(local_replica_weight_bytes, kernels::kNumTMAAlignBytes);
-    EP_HOST_ASSERT(local_replica_weight_buffer != nullptr && "Failed to allocate NVSHMEM weight buffer");
-
-    auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
     const int64_t expert_total_weight_bytes = checked_num_bytes(expert_total_numel, weight_data_element_bytes);
-    local_replica_weight_buffer_tensor = torch::from_blob(local_replica_weight_buffer,
-                                                          {num_local_redundant_experts, expert_total_weight_bytes},
-                                                          {expert_total_weight_bytes, 1},
-                                                          byte_opts);
-    local_replica_fc1_weight_buffer_tensor = torch::from_blob(local_replica_weight_buffer,
-                                                              {num_local_redundant_experts, expert_fc1_weight_bytes},
-                                                              {expert_total_weight_bytes, 1},
-                                                              byte_opts);
+    auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
+    auto validate_cuda_tensor = [&](const torch::Tensor& tensor, torch::ScalarType dtype, const char* name) {
+        EP_HOST_ASSERT(tensor.defined() && tensor.is_cuda() && tensor.dtype() == dtype && tensor.is_contiguous());
+        EP_HOST_ASSERT(tensor.device().index() == device_id && "Symmetric buffers must use the runtime CUDA device");
+        (void)name;
+    };
+
+    // The Python side allocates and rendezvouses these buffers with
+    // torch.distributed._symmetric_memory.  C++ only keeps tensor references and
+    // extracts local/remote addresses; it never owns or frees the allocations.
+    validate_cuda_tensor(local_replica_weight_buffer_external, torch::kUInt8, "weight buffer");
+    EP_HOST_ASSERT(local_replica_weight_buffer_external.dim() == 2 &&
+                   local_replica_weight_buffer_external.size(0) == num_local_redundant_experts &&
+                   local_replica_weight_buffer_external.size(1) == expert_total_weight_bytes);
+    local_replica_weight_buffer_tensor = local_replica_weight_buffer_external;
+    local_replica_weight_buffer = local_replica_weight_buffer_tensor.data_ptr();
+    local_replica_fc1_weight_buffer_tensor = local_replica_weight_buffer_tensor.narrow(1, 0, expert_fc1_weight_bytes);
     local_replica_fc2_weight_buffer_tensor =
-        torch::from_blob(reinterpret_cast<uint8_t*>(local_replica_weight_buffer) + expert_fc1_weight_bytes,
-                         {num_local_redundant_experts, expert_fc2_weight_bytes},
-                         {expert_total_weight_bytes, 1},
-                         byte_opts);
+        local_replica_weight_buffer_tensor.narrow(1, expert_fc1_weight_bytes, expert_fc2_weight_bytes);
 
     if (expert_weight_scale_total_numel > 0) {
-        const int64_t local_replica_weight_scale_bytes =
-            static_cast<int64_t>(num_local_redundant_experts) * expert_weight_scale_stride_bytes;
-        local_replica_weight_scale_buffer =
-            nvshmem::alloc(local_replica_weight_scale_bytes, kernels::kNumTMAAlignBytes);
-        EP_HOST_ASSERT(local_replica_weight_scale_buffer != nullptr &&
-                       "Failed to allocate NVSHMEM weight-scale buffer");
-        local_replica_weight_scale_buffer_tensor =
-            torch::from_blob(local_replica_weight_scale_buffer,
-                             {num_local_redundant_experts, expert_weight_scale_stride_bytes},
-                             {expert_weight_scale_stride_bytes, 1},
-                             byte_opts);
+        validate_cuda_tensor(local_replica_weight_scale_buffer_external, torch::kUInt8, "weight-scale buffer");
+        EP_HOST_ASSERT(local_replica_weight_scale_buffer_external.dim() == 2 &&
+                       local_replica_weight_scale_buffer_external.size(0) == num_local_redundant_experts &&
+                       local_replica_weight_scale_buffer_external.size(1) == expert_weight_scale_stride_bytes);
+        local_replica_weight_scale_buffer_tensor = local_replica_weight_scale_buffer_external;
+        local_replica_weight_scale_buffer = local_replica_weight_scale_buffer_tensor.data_ptr();
         local_replica_fc1_weight_scale_buffer_tensor =
-            torch::from_blob(local_replica_weight_scale_buffer,
-                             {num_local_redundant_experts, expert_fc1_weight_scale_bytes},
-                             {expert_weight_scale_stride_bytes, 1},
-                             byte_opts);
-        local_replica_fc2_weight_scale_buffer_tensor = torch::from_blob(
-            reinterpret_cast<uint8_t*>(local_replica_weight_scale_buffer) + expert_weight_scale_fc2_offset_bytes,
-            {num_local_redundant_experts, expert_fc2_weight_scale_bytes},
-            {expert_weight_scale_stride_bytes, 1},
-            byte_opts);
+            local_replica_weight_scale_buffer_tensor.narrow(1, 0, expert_fc1_weight_scale_bytes);
+        local_replica_fc2_weight_scale_buffer_tensor = local_replica_weight_scale_buffer_tensor.narrow(
+            1, expert_weight_scale_fc2_offset_bytes, expert_fc2_weight_scale_bytes);
     } else {
-        auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
-        local_replica_weight_scale_buffer_tensor = torch::empty({num_local_redundant_experts, 0}, byte_opts);
-        local_replica_fc1_weight_scale_buffer_tensor = torch::empty({num_local_redundant_experts, 0}, byte_opts);
-        local_replica_fc2_weight_scale_buffer_tensor = torch::empty({num_local_redundant_experts, 0}, byte_opts);
+        local_replica_weight_scale_buffer_tensor =
+            torch::empty({num_local_redundant_experts, 0}, byte_opts);
+        local_replica_fc1_weight_scale_buffer_tensor = local_replica_weight_scale_buffer_tensor;
+        local_replica_fc2_weight_scale_buffer_tensor = local_replica_weight_scale_buffer_tensor;
     }
 
     const int max_relay_chunks_per_shard = max_weight_sync_chunks_per_shard(expert_fc1_numel,
@@ -363,69 +357,97 @@ Manager::Manager(const int& num_layers,
                                                                             weight_data_element_bytes);
     const int64_t local_ready_flag_count = static_cast<int64_t>(num_local_redundant_experts) *
         weight_sync_num_shards(expert_weight_scale_total_numel) * max_relay_chunks_per_shard;
-    local_weight_sync_ready_flags = reinterpret_cast<uint64_t*>(
-        nvshmem::alloc(local_ready_flag_count * sizeof(uint64_t), kernels::kNumTMAAlignBytes));
-    EP_HOST_ASSERT(local_weight_sync_ready_flags != nullptr &&
-                   "Failed to allocate NVSHMEM ready-flag buffer for relay weight sync");
-    if (local_ready_flag_count > 0) {
-        CUDA_RUNTIME_CHECK(cudaMemset(local_weight_sync_ready_flags, 0, local_ready_flag_count * sizeof(uint64_t)));
-    }
+    validate_cuda_tensor(local_weight_sync_ready_flags_external, torch::kUInt64, "ready-flag buffer");
+    EP_HOST_ASSERT(local_weight_sync_ready_flags_external.dim() == 1 &&
+                   local_weight_sync_ready_flags_external.numel() >= std::max<int64_t>(local_ready_flag_count, 1));
+    local_weight_sync_ready_flags = local_weight_sync_ready_flags_external.data_ptr<uint64_t>();
+    CUDA_RUNTIME_CHECK(cudaMemset(local_weight_sync_ready_flags,
+                                  0,
+                                  std::max<int64_t>(local_ready_flag_count, 1) * sizeof(uint64_t)));
 
     // Grad buffer only needed for training
     if (is_train) {
-        int64_t local_replica_grad_bytes = static_cast<int64_t>(num_local_redundant_experts) *
-            checked_num_bytes(expert_total_numel, grad_element_bytes);
-        local_replica_grad_buffer = nvshmem::alloc(local_replica_grad_bytes, kernels::kNumTMAAlignBytes);
-        EP_HOST_ASSERT(local_replica_grad_buffer != nullptr && "Failed to allocate NVSHMEM grad buffer");
-        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, device_id));
-        local_replica_grad_buffer_tensor = torch::from_blob(local_replica_grad_buffer,
-                                                            {num_local_redundant_experts, expert_total_numel},
-                                                            {expert_total_numel, 1},
-                                                            grad_opts);
-        local_replica_fc1_grad_buffer_tensor = torch::from_blob(local_replica_grad_buffer,
-                                                                {num_local_redundant_experts, expert_fc1_numel},
-                                                                {expert_total_numel, 1},
-                                                                grad_opts);
+        validate_cuda_tensor(local_replica_grad_buffer_external, torch::kFloat32, "grad buffer");
+        EP_HOST_ASSERT(local_replica_grad_buffer_external.dim() == 2 &&
+                       local_replica_grad_buffer_external.size(0) == num_local_redundant_experts &&
+                       local_replica_grad_buffer_external.size(1) == expert_total_numel);
+        local_replica_grad_buffer_tensor = local_replica_grad_buffer_external;
+        local_replica_grad_buffer = local_replica_grad_buffer_tensor.data_ptr();
+        local_replica_fc1_grad_buffer_tensor = local_replica_grad_buffer_tensor.narrow(1, 0, expert_fc1_numel);
         local_replica_fc2_grad_buffer_tensor =
-            torch::from_blob(reinterpret_cast<float*>(local_replica_grad_buffer) + expert_fc1_numel,
-                             {num_local_redundant_experts, expert_fc2_numel},
-                             {expert_total_numel, 1},
-                             grad_opts);
+            local_replica_grad_buffer_tensor.narrow(1, expert_fc1_numel, expert_fc2_numel);
         local_replica_grad_buffer_tensor.zero_();
+    } else {
+        local_replica_grad_buffer_tensor = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat32).device(
+                                                               torch::Device(torch::kCUDA, device_id)));
     }
 
-    // Synchronize all PEs to ensure buffers are allocated on all ranks
-    nvshmem::barrier(true);
+    auto copy_remote_pointer_table = [&](const torch::Tensor& table,
+                                          void** host_table,
+                                          void**& device_table,
+                                          const char* name,
+                                          bool required) {
+        if (!required) {
+            return;
+        }
+        EP_HOST_ASSERT(table.defined() && !table.is_cuda() && table.dtype() == torch::kInt64 &&
+                       table.is_contiguous() && table.dim() == 1 && table.numel() == runtime::num_nvl_ranks);
+        const auto* values = table.data_ptr<int64_t>();
+        for (int rank = 0; rank < runtime::num_nvl_ranks; ++rank) {
+            EP_HOST_ASSERT(values[rank] != 0 && "Symmetric Memory returned a null peer pointer");
+            host_table[rank] = reinterpret_cast<void*>(static_cast<uintptr_t>(values[rank]));
+        }
+        void* allocation = nullptr;
+        CUDA_RUNTIME_CHECK(cudaMalloc(&allocation, kernels::kMaxNvlDomainSize * sizeof(void*)));
+        device_table = reinterpret_cast<void**>(allocation);
+        CUDA_RUNTIME_CHECK(cudaMemset(device_table, 0, kernels::kMaxNvlDomainSize * sizeof(void*)));
+        CUDA_RUNTIME_CHECK(cudaMemcpy(device_table,
+                                      host_table,
+                                      runtime::num_nvl_ranks * sizeof(void*),
+                                      cudaMemcpyHostToDevice));
+        (void)name;
+    };
 
-    // Obtain remote pointers via nvshmem_ptr() for all NVL ranks
-    int num_nvl_ranks = runtime::num_nvl_ranks;
-    int rdma_rank_idx = runtime::rdma_rank_idx;
-    for (int i = 0; i < num_nvl_ranks; ++i) {
-        int target_rank = rdma_rank_idx * num_nvl_ranks + i;
-        global_replica_weight_buffer_ptrs[i] = nvshmem::ptr(local_replica_weight_buffer, target_rank);
-        EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[i] != nullptr &&
-                       "nvshmem_ptr failed for weight buffer - target PE may not be in same NVL domain");
-        if (expert_weight_scale_total_numel > 0) {
-            global_replica_weight_scale_buffer_ptrs[i] = nvshmem::ptr(local_replica_weight_scale_buffer, target_rank);
-            EP_HOST_ASSERT(global_replica_weight_scale_buffer_ptrs[i] != nullptr &&
-                           "nvshmem_ptr failed for weight-scale buffer - target PE may not be in same NVL domain");
+    copy_remote_pointer_table(remote_weight_ptrs_external,
+                              global_replica_weight_buffer_ptrs,
+                              _remote_weight_ptrs,
+                              "weight",
+                              true);
+    copy_remote_pointer_table(remote_weight_scale_ptrs_external,
+                              global_replica_weight_scale_buffer_ptrs,
+                              _remote_weight_scale_ptrs,
+                              "weight scale",
+                              expert_weight_scale_total_numel > 0);
+    copy_remote_pointer_table(remote_grad_ptrs_external,
+                              global_replica_grad_buffer_ptrs,
+                              _remote_grad_ptrs,
+                              "grad",
+                              is_train);
+    // Ready flags use the same 64-bit pointer representation as the other
+    // tables, but are consumed as uint64_t** by the CUDA kernels.
+    if (local_weight_sync_ready_flags_external.defined()) {
+        EP_HOST_ASSERT(remote_ready_ptrs_external.defined() && !remote_ready_ptrs_external.is_cuda() &&
+                       remote_ready_ptrs_external.dtype() == torch::kInt64 &&
+                       remote_ready_ptrs_external.is_contiguous() &&
+                       remote_ready_ptrs_external.dim() == 1 &&
+                       remote_ready_ptrs_external.numel() == runtime::num_nvl_ranks);
+        const auto* values = remote_ready_ptrs_external.data_ptr<int64_t>();
+        for (int rank = 0; rank < runtime::num_nvl_ranks; ++rank) {
+            EP_HOST_ASSERT(values[rank] != 0 && "Symmetric Memory returned a null ready pointer");
+            global_weight_sync_ready_flag_ptrs[rank] =
+                reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(values[rank]));
         }
-        global_weight_sync_ready_flag_ptrs[i] =
-            reinterpret_cast<uint64_t*>(nvshmem::ptr(local_weight_sync_ready_flags, target_rank));
-        EP_HOST_ASSERT(global_weight_sync_ready_flag_ptrs[i] != nullptr &&
-                       "nvshmem_ptr failed for ready-flag buffer - target PE may not be in same NVL domain");
-        if (is_train) {
-            global_replica_grad_buffer_ptrs[i] = nvshmem::ptr(local_replica_grad_buffer, target_rank);
-            EP_HOST_ASSERT(global_replica_grad_buffer_ptrs[i] != nullptr &&
-                           "nvshmem_ptr failed for grad buffer - target PE may not be in same NVL domain");
-        }
+        void* allocation = nullptr;
+        CUDA_RUNTIME_CHECK(cudaMalloc(&allocation, kernels::kMaxNvlDomainSize * sizeof(uint64_t*)));
+        _remote_ready_flag_ptrs = reinterpret_cast<uint64_t**>(allocation);
+        CUDA_RUNTIME_CHECK(cudaMemset(_remote_ready_flag_ptrs,
+                                      0,
+                                      kernels::kMaxNvlDomainSize * sizeof(uint64_t*)));
+        CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_ready_flag_ptrs,
+                                      global_weight_sync_ready_flag_ptrs,
+                                      runtime::num_nvl_ranks * sizeof(uint64_t*),
+                                      cudaMemcpyHostToDevice));
     }
-
-    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_ready_flag_ptrs, kernels::kMaxNvlDomainSize * sizeof(uint64_t*)));
-    CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_ready_flag_ptrs,
-                                  global_weight_sync_ready_flag_ptrs,
-                                  kernels::kMaxNvlDomainSize * sizeof(uint64_t*),
-                                  cudaMemcpyHostToDevice));
 
     // Allocate intermediate buffers for task-build and persistent kernels.
     CUDA_RUNTIME_CHECK(
@@ -470,26 +492,6 @@ Manager::Manager(const int& num_layers,
     CUDA_RUNTIME_CHECK(
         cudaMemcpy(_task_build_config, &config_cpu, sizeof(kernels::TaskBuildConfig), cudaMemcpyHostToDevice));
 
-    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_weight_ptrs, kernels::kMaxNvlDomainSize * sizeof(void*)));
-    CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_weight_ptrs,
-                                  global_replica_weight_buffer_ptrs,
-                                  kernels::kMaxNvlDomainSize * sizeof(void*),
-                                  cudaMemcpyHostToDevice));
-    if (expert_weight_scale_total_numel > 0) {
-        CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_weight_scale_ptrs, kernels::kMaxNvlDomainSize * sizeof(void*)));
-        CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_weight_scale_ptrs,
-                                      global_replica_weight_scale_buffer_ptrs,
-                                      kernels::kMaxNvlDomainSize * sizeof(void*),
-                                      cudaMemcpyHostToDevice));
-    }
-    if (is_train) {
-        CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_grad_ptrs, kernels::kMaxNvlDomainSize * sizeof(void*)));
-        CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_grad_ptrs,
-                                      global_replica_grad_buffer_ptrs,
-                                      kernels::kMaxNvlDomainSize * sizeof(void*),
-                                      cudaMemcpyHostToDevice));
-    }
-
     const int max_stage_tiles_per_expert = weight_sync_tiles_for_shards(expert_fc1_numel,
                                                                         expert_fc2_numel,
                                                                         expert_fc1_weight_scale_bytes,
@@ -499,13 +501,11 @@ Manager::Manager(const int& num_layers,
 
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_reroute_sparse_counters, num_global_logical_experts * sizeof(int)));
 
-    global_logical_expert_loads =
-        reinterpret_cast<int*>(nvshmem::alloc(num_global_logical_experts * sizeof(int), kernels::kNumTMAAlignBytes));
-    local_expert_loads = reinterpret_cast<int32_t*>(
-        nvshmem::alloc(num_global_logical_experts * sizeof(int32_t), kernels::kNumTMAAlignBytes));
-    expert_loads_per_rank = reinterpret_cast<int32_t*>(
-        nvshmem::alloc(static_cast<size_t>(runtime::num_ranks) * num_global_logical_experts * sizeof(int32_t),
-                       kernels::kNumTMAAlignBytes));
+    auto placement_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::Device(torch::kCUDA, device_id));
+    global_logical_expert_loads_tensor = torch::empty({num_global_logical_experts}, placement_opts);
+    local_expert_loads_tensor = torch::empty({num_global_logical_experts}, placement_opts);
+    expert_loads_per_rank_tensor =
+        torch::empty({runtime::num_ranks, num_global_logical_experts}, placement_opts);
     // Initialize default placement (master-only) for all layers so sparse reroute
     // remains valid before the first placement update.
     for (int lid = 0; lid < num_layers; ++lid) {
@@ -527,7 +527,8 @@ Manager::Manager(const int& num_layers,
     }
     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()));
 
-    // Ready to use (no IPC handle exchange needed with NVSHMEM)
+    // Ready to use.  Symmetric Memory handles and ownership stay on the Python
+    // side; C++ has retained the local tensor views and device pointer tables.
     _available = true;
 }
 
@@ -545,34 +546,25 @@ Manager::~Manager() noexcept(false) {
 void Manager::destroy() {
     EP_HOST_ASSERT(is_available());
 
-    // Synchronize all PEs before cleanup
-    nvshmem::barrier(true);
-
-    // Free NVSHMEM symmetric heap buffers
-    nvshmem::free(local_replica_weight_buffer);
+    // The Python owner must keep symmetric allocations alive until this point.
+    // C++ only releases its Tensor references after all local work is complete.
+    CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
     local_replica_weight_buffer = nullptr;
-    if (local_replica_weight_scale_buffer != nullptr) {
-        nvshmem::free(local_replica_weight_scale_buffer);
-        local_replica_weight_scale_buffer = nullptr;
-    }
-    if (local_weight_sync_ready_flags != nullptr) {
-        nvshmem::free(local_weight_sync_ready_flags);
-        local_weight_sync_ready_flags = nullptr;
-    }
-    if (local_replica_grad_buffer != nullptr) {
-        nvshmem::free(local_replica_grad_buffer);
-        local_replica_grad_buffer = nullptr;
-    }
-    nvshmem::free(global_logical_expert_loads);
-    global_logical_expert_loads = nullptr;
-    if (local_expert_loads != nullptr) {
-        nvshmem::free(local_expert_loads);
-        local_expert_loads = nullptr;
-    }
-    if (expert_loads_per_rank != nullptr) {
-        nvshmem::free(expert_loads_per_rank);
-        expert_loads_per_rank = nullptr;
-    }
+    local_replica_weight_scale_buffer = nullptr;
+    local_weight_sync_ready_flags = nullptr;
+    local_replica_grad_buffer = nullptr;
+    local_replica_weight_buffer_tensor = torch::Tensor();
+    local_replica_fc1_weight_buffer_tensor = torch::Tensor();
+    local_replica_fc2_weight_buffer_tensor = torch::Tensor();
+    local_replica_weight_scale_buffer_tensor = torch::Tensor();
+    local_replica_fc1_weight_scale_buffer_tensor = torch::Tensor();
+    local_replica_fc2_weight_scale_buffer_tensor = torch::Tensor();
+    local_replica_grad_buffer_tensor = torch::Tensor();
+    local_replica_fc1_grad_buffer_tensor = torch::Tensor();
+    local_replica_fc2_grad_buffer_tensor = torch::Tensor();
+    global_logical_expert_loads_tensor = torch::Tensor();
+    local_expert_loads_tensor = torch::Tensor();
+    expert_loads_per_rank_tensor = torch::Tensor();
 
     // Clear remote pointers
     for (int i = 0; i < runtime::num_nvl_ranks; ++i) {
@@ -639,9 +631,6 @@ void Manager::destroy() {
     // Free contiguous placement buffers (CPU pinned + GPU)
     placement.cleanup();
 
-    // Free NVSHMEM runtime
-    runtime::destroy();
-
     // Ready to destroy
     _available = false;
 }
@@ -665,170 +654,117 @@ void Manager::wait_for_placement_ready(const int layer_id, const at::cuda::CUDAS
     stream_wait(stream, placement_ready_events_[slot].value());
 }
 
-void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) {
+void Manager::compute_local_loads(torch::Tensor& routing_map) {
     EP_HOST_ASSERT(is_available());
-    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
-    EP_HOST_ASSERT(routing_map.dim() == 2 && routing_map.size(1) == num_global_logical_experts &&
+    EP_HOST_ASSERT(routing_map.is_cuda() && routing_map.is_contiguous() &&
+                   routing_map.dim() == 2 && routing_map.size(1) == num_global_logical_experts &&
                    routing_map.dtype() == torch::kBool);
 
-    auto curr_stream = at::cuda::getCurrentCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
 
     kernels::rmap_local_sum(routing_map.size(0),
                             num_global_logical_experts,
                             routing_map.data_ptr<bool>(),
-                            global_logical_expert_loads,
-                            curr_stream.stream());
-
-    auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
-        placement.get_device_ptrs(layer_id);
-    auto [logical_instance_quota, logical_instance_quota_prefix, rank_quota_prefix] =
-        placement.get_quota_ptrs(layer_id);
-
-    if (legacy_placement_) {
-        nvshmem::int32_allreduce(global_logical_expert_loads, num_global_logical_experts, curr_stream.stream());
-        kernels::legacy::solve_placement(global_logical_expert_loads,
-                                         nullptr,
-                                         physical_to_logical_map,
-                                         logical_to_physical_map,
-                                         logical_replica_counts,
-                                         logical_instance_quota,
-                                         logical_instance_quota_prefix,
-                                         rank_quota_prefix,
-                                         curr_stream.stream(),
-                                         num_global_logical_experts,
-                                         runtime::num_ranks,
-                                         num_local_master_experts,
-                                         num_local_redundant_experts,
-                                         runtime::num_nvl_ranks,
-                                         runtime::num_ranks,
-                                         balance_threshold_,
-                                         quota_min_tokens_per_replica_,
-                                         quota_allow_zero_master_quota_,
-                                         quota_locality_aware_,
-                                         quota_oracle_eps_,
-                                         quota_kernel_stage_);
-    } else {
-        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(local_expert_loads,
-                                           global_logical_expert_loads,
-                                           num_global_logical_experts * sizeof(int32_t),
-                                           cudaMemcpyDeviceToDevice,
-                                           curr_stream.stream()));
-        nvshmem::int32_fcollect(
-            expert_loads_per_rank, local_expert_loads, num_global_logical_experts, curr_stream.stream());
-        kernels::reduce_per_rank_loads(expert_loads_per_rank,
-                                       global_logical_expert_loads,
-                                       runtime::num_ranks,
-                                       num_global_logical_experts,
-                                       curr_stream.stream());
-        kernels::solve_placement(global_logical_expert_loads,
-                                 expert_loads_per_rank,
-                                 physical_to_logical_map,
-                                 logical_to_physical_map,
-                                 logical_replica_counts,
-                                 logical_instance_quota,
-                                 logical_instance_quota_prefix,
-                                 rank_quota_prefix,
-                                 curr_stream.stream(),
-                                 num_global_logical_experts,
-                                 runtime::num_ranks,
-                                 num_local_master_experts,
-                                 num_local_redundant_experts,
-                                 runtime::num_nvl_ranks,
-                                 runtime::num_ranks,
-                                 balance_threshold_,
-                                 quota_min_tokens_per_replica_,
-                                 quota_allow_zero_master_quota_,
-                                 quota_locality_aware_,
-                                 quota_oracle_eps_,
-                                 quota_kernel_stage_);
-    }
-    record_placement_ready(layer_id, curr_stream);
+                            local_expert_loads_tensor.data_ptr<int32_t>(),
+                            stream.stream());
 }
 
-void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_ids) {
+void Manager::compute_local_loads_sparse(torch::Tensor& topk_ids) {
     EP_HOST_ASSERT(is_available());
-    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
-    EP_HOST_ASSERT(topk_ids.is_cuda() && topk_ids.dtype() == torch::kInt64);
+    EP_HOST_ASSERT(topk_ids.is_cuda() && topk_ids.is_contiguous() && topk_ids.dtype() == torch::kInt64);
     EP_HOST_ASSERT(topk_ids.dim() == 2);
 
-    int T = topk_ids.size(0);
-    int K = topk_ids.size(1);
-
-    // Use comm_stream for histogram + allreduce (same pattern as update_placement)
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    stream_wait(comm_stream, compute_stream);
-
+    auto stream = at::cuda::getCurrentCUDAStream();
     kernels::topk_local_sum(topk_ids.data_ptr<int64_t>(),
-                            T,
-                            K,
+                            topk_ids.size(0),
+                            topk_ids.size(1),
                             num_global_logical_experts,
-                            global_logical_expert_loads,
-                            comm_stream.stream());
+                            local_expert_loads_tensor.data_ptr<int32_t>(),
+                            stream.stream());
+}
 
+void Manager::solve_placement_legacy(const int& layer_id, torch::Tensor& global_loads) {
+    EP_HOST_ASSERT(is_available());
+    EP_HOST_ASSERT(legacy_placement_ && layer_id >= 0 && layer_id < num_layers);
+    EP_HOST_ASSERT(global_loads.is_cuda() && global_loads.is_contiguous() &&
+                   global_loads.dtype() == torch::kInt32 && global_loads.dim() == 1 &&
+                   global_loads.size(0) == num_global_logical_experts);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (global_loads.data_ptr<int32_t>() != global_logical_expert_loads_tensor.data_ptr<int32_t>()) {
+        global_logical_expert_loads_tensor.copy_(global_loads);
+    }
     auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
         placement.get_device_ptrs(layer_id);
     auto [logical_instance_quota, logical_instance_quota_prefix, rank_quota_prefix] =
         placement.get_quota_ptrs(layer_id);
+    kernels::legacy::solve_placement(global_logical_expert_loads_tensor.data_ptr<int32_t>(),
+                                     nullptr,
+                                     physical_to_logical_map,
+                                     logical_to_physical_map,
+                                     logical_replica_counts,
+                                     logical_instance_quota,
+                                     logical_instance_quota_prefix,
+                                     rank_quota_prefix,
+                                     stream.stream(),
+                                     num_global_logical_experts,
+                                     runtime::num_ranks,
+                                     num_local_master_experts,
+                                     num_local_redundant_experts,
+                                     runtime::num_nvl_ranks,
+                                     runtime::num_ranks,
+                                     balance_threshold_,
+                                     quota_min_tokens_per_replica_,
+                                     quota_allow_zero_master_quota_,
+                                     quota_locality_aware_,
+                                     quota_oracle_eps_,
+                                     quota_kernel_stage_);
+    record_placement_ready(layer_id, stream);
+}
 
-    if (legacy_placement_) {
-        nvshmem::int32_allreduce(global_logical_expert_loads, num_global_logical_experts, comm_stream.stream());
-        kernels::legacy::solve_placement(global_logical_expert_loads,
-                                         nullptr,
-                                         physical_to_logical_map,
-                                         logical_to_physical_map,
-                                         logical_replica_counts,
-                                         logical_instance_quota,
-                                         logical_instance_quota_prefix,
-                                         rank_quota_prefix,
-                                         comm_stream.stream(),
-                                         num_global_logical_experts,
-                                         runtime::num_ranks,
-                                         num_local_master_experts,
-                                         num_local_redundant_experts,
-                                         runtime::num_nvl_ranks,
-                                         runtime::num_ranks,
-                                         balance_threshold_,
-                                         quota_min_tokens_per_replica_,
-                                         quota_allow_zero_master_quota_,
-                                         quota_locality_aware_,
-                                         quota_oracle_eps_,
-                                         quota_kernel_stage_);
-    } else {
-        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(local_expert_loads,
-                                           global_logical_expert_loads,
-                                           num_global_logical_experts * sizeof(int32_t),
-                                           cudaMemcpyDeviceToDevice,
-                                           comm_stream.stream()));
-        nvshmem::int32_fcollect(
-            expert_loads_per_rank, local_expert_loads, num_global_logical_experts, comm_stream.stream());
-        kernels::reduce_per_rank_loads(expert_loads_per_rank,
-                                       global_logical_expert_loads,
-                                       runtime::num_ranks,
-                                       num_global_logical_experts,
-                                       comm_stream.stream());
-        kernels::solve_placement(global_logical_expert_loads,
-                                 expert_loads_per_rank,
-                                 physical_to_logical_map,
-                                 logical_to_physical_map,
-                                 logical_replica_counts,
-                                 logical_instance_quota,
-                                 logical_instance_quota_prefix,
-                                 rank_quota_prefix,
-                                 comm_stream.stream(),
-                                 num_global_logical_experts,
-                                 runtime::num_ranks,
-                                 num_local_master_experts,
-                                 num_local_redundant_experts,
-                                 runtime::num_nvl_ranks,
-                                 runtime::num_ranks,
-                                 balance_threshold_,
-                                 quota_min_tokens_per_replica_,
-                                 quota_allow_zero_master_quota_,
-                                 quota_locality_aware_,
-                                 quota_oracle_eps_,
-                                 quota_kernel_stage_);
+void Manager::solve_placement(const int& layer_id, torch::Tensor& loads_per_rank) {
+    EP_HOST_ASSERT(is_available());
+    EP_HOST_ASSERT(!legacy_placement_ && layer_id >= 0 && layer_id < num_layers);
+    EP_HOST_ASSERT(loads_per_rank.is_cuda() && loads_per_rank.is_contiguous() &&
+                   loads_per_rank.dtype() == torch::kInt32 && loads_per_rank.dim() == 2 &&
+                   loads_per_rank.size(0) == runtime::num_ranks &&
+                   loads_per_rank.size(1) == num_global_logical_experts);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (loads_per_rank.data_ptr<int32_t>() != expert_loads_per_rank_tensor.data_ptr<int32_t>()) {
+        expert_loads_per_rank_tensor.copy_(loads_per_rank);
     }
-    record_placement_ready(layer_id, comm_stream);
+    auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
+        placement.get_device_ptrs(layer_id);
+    auto [logical_instance_quota, logical_instance_quota_prefix, rank_quota_prefix] =
+        placement.get_quota_ptrs(layer_id);
+    kernels::reduce_per_rank_loads(expert_loads_per_rank_tensor.data_ptr<int32_t>(),
+                                   global_logical_expert_loads_tensor.data_ptr<int32_t>(),
+                                   runtime::num_ranks,
+                                   num_global_logical_experts,
+                                   stream.stream());
+    kernels::solve_placement(global_logical_expert_loads_tensor.data_ptr<int32_t>(),
+                             expert_loads_per_rank_tensor.data_ptr<int32_t>(),
+                             physical_to_logical_map,
+                             logical_to_physical_map,
+                             logical_replica_counts,
+                             logical_instance_quota,
+                             logical_instance_quota_prefix,
+                             rank_quota_prefix,
+                             stream.stream(),
+                             num_global_logical_experts,
+                             runtime::num_ranks,
+                             num_local_master_experts,
+                             num_local_redundant_experts,
+                             runtime::num_nvl_ranks,
+                             runtime::num_ranks,
+                             balance_threshold_,
+                             quota_min_tokens_per_replica_,
+                             quota_allow_zero_master_quota_,
+                             quota_locality_aware_,
+                             quota_oracle_eps_,
+                             quota_kernel_stage_);
+    record_placement_ready(layer_id, stream);
 }
 
 void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
@@ -1037,16 +973,21 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                                 std::optional<EventHandle>& previous_event,
-                                                bool async) {
+                                                bool async,
+                                                bool use_current_stream) {
     EP_HOST_ASSERT(is_available());
 
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    const auto caller_stream = at::cuda::getCurrentCUDAStream();
+    // Combined 1F1B can place GR directly on its communication stream.  This removes
+    // UltraEP's otherwise-private third stream from the full-layer CUDA graph while
+    // preserving the default private-stream behavior for all existing callers.
+    const auto launch_stream = use_current_stream ? caller_stream : comm_stream;
     std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
-        stream_wait(comm_stream, previous_event.value());
-    } else {
-        stream_wait(comm_stream, compute_stream);
+        stream_wait(launch_stream, previous_event.value());
+    } else if (launch_stream.id() != caller_stream.id()) {
+        stream_wait(launch_stream, caller_stream);
     }
 
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.dtype() == torch::kInt64);
@@ -1072,21 +1013,21 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                      _task_tile_offsets,
                                      _task_metadata,
                                      _global_task_or_tile_counter,
-                                     comm_stream);
+                                     launch_stream);
 
     kernels::run_grad_reduce(_grad_reduce_tasks,
                              _task_tile_offsets,
                              _task_metadata,
                              _global_task_or_tile_counter,
-                             comm_stream,
+                             launch_stream,
                              grad_reduce_num_sms_,
                              grad_reduce_deterministic_);
 
     // Wait streams
     if (async) {
-        event = EventHandle(comm_stream);
-    } else {
-        stream_wait(compute_stream, comm_stream);
+        event = EventHandle(launch_stream);
+    } else if (launch_stream.id() != caller_stream.id()) {
+        stream_wait(caller_stream, launch_stream);
     }
 
     return event;
@@ -1106,10 +1047,8 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-        stream_wait(relay_stream, previous_event.value());
     } else {
         stream_wait(comm_stream, compute_stream);
-        stream_wait(relay_stream, compute_stream);
     }
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);

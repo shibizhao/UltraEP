@@ -4,7 +4,8 @@ from typing import List, Optional
 
 import ultra_ep._C as _C
 from .config import load_tuning_from_env
-from .runtime import init_runtime
+from .runtime import init_runtime, get_symmetric_group, retain_runtime, release_runtime
+from .symmetric_memory import allocate_region
 from .event import EventHandle
 from .profiling import ExpertLoadProfiler, load_profile_config
 from .reroute import _DenseRerouteFunction
@@ -127,6 +128,105 @@ class Manager:
             tuning.weight_sync_relay_min_fanout_gain
         )
         self.reroute_mode = "round_robin" if legacy_placement else "quota"
+
+        # Symmetric Memory allocations are initialized once per EP group.  Keep
+        # the logical views and handles alive on the Python side; C++ only holds
+        # tensor references and consumes the mapped peer pointer tables.
+        def _align16(value: int) -> int:
+            return (int(value) + 15) // 16 * 16
+
+        expert_fc1_weight_bytes = (
+            self.expert_fc1_numel * self.weight_data_element_bytes
+        )
+        expert_fc2_weight_bytes = (
+            self.expert_fc2_numel * self.weight_data_element_bytes
+        )
+        expert_total_weight_bytes = (
+            self.expert_total_numel * self.weight_data_element_bytes
+        )
+        scale_fc1_bytes = (
+            self.expert_fc1_weight_scale_numel * self.weight_scale_element_bytes
+        )
+        scale_fc2_bytes = (
+            self.expert_fc2_weight_scale_numel * self.weight_scale_element_bytes
+        )
+        scale_fc2_offset_bytes = _align16(scale_fc1_bytes)
+        scale_stride_bytes = _align16(scale_fc2_offset_bytes + scale_fc2_bytes)
+
+        def _num_chunks(num_bytes: int) -> int:
+            tiles = (int(num_bytes) + 32 * 1024 - 1) // (32 * 1024)
+            return (tiles + 8 - 1) // 8
+
+        max_relay_chunks = max(
+            _num_chunks(expert_fc1_weight_bytes),
+            _num_chunks(expert_fc2_weight_bytes),
+            _num_chunks(scale_fc1_bytes),
+            _num_chunks(scale_fc2_bytes),
+        )
+        num_ready_shards = 4 if self.expert_weight_scale_total_numel > 0 else 2
+        ready_flag_count = (
+            self.num_local_redundant_experts * num_ready_shards * max_relay_chunks
+        )
+
+        self._symm_regions = []
+        weight_region = allocate_region(
+            self.num_local_redundant_experts * expert_total_weight_bytes,
+            dtype=torch.uint8,
+            device=torch.device("cuda", self.device),
+            group=get_symmetric_group(),
+            local_shape=(self.num_local_redundant_experts, expert_total_weight_bytes),
+        )
+        self._symm_regions.append(weight_region)
+        if self.expert_weight_scale_total_numel > 0:
+            scale_region = allocate_region(
+                self.num_local_redundant_experts * scale_stride_bytes,
+                dtype=torch.uint8,
+                device=torch.device("cuda", self.device),
+                group=get_symmetric_group(),
+                local_shape=(self.num_local_redundant_experts, scale_stride_bytes),
+            )
+            self._symm_regions.append(scale_region)
+            local_scale_buffer = scale_region.local
+            remote_scale_ptrs = scale_region.remote_ptrs
+        else:
+            local_scale_buffer = torch.empty(
+                (self.num_local_redundant_experts, 0),
+                dtype=torch.uint8,
+                device=torch.device("cuda", self.device),
+            )
+            remote_scale_ptrs = torch.empty(0, dtype=torch.int64)
+
+        ready_region = allocate_region(
+            ready_flag_count,
+            dtype=torch.uint64,
+            device=torch.device("cuda", self.device),
+            group=get_symmetric_group(),
+        )
+        self._symm_regions.append(ready_region)
+        # Use dedicated Symmetric Memory signal pads for the buffer lifetime
+        # barriers.  The barrier is issued on the same CUDA stream as the
+        # corresponding kernel sequence, so it remains CUDA-graph capturable
+        # and does not consume a host-side dist.barrier rendezvous.
+        self._weight_lifetime_barrier_handle = weight_region.handle
+        self._grad_lifetime_barrier_handle = ready_region.handle
+
+        if is_train:
+            grad_region = allocate_region(
+                self.num_local_redundant_experts * self.expert_total_numel,
+                dtype=torch.float32,
+                device=torch.device("cuda", self.device),
+                group=get_symmetric_group(),
+                local_shape=(self.num_local_redundant_experts, self.expert_total_numel),
+            )
+            self._symm_regions.append(grad_region)
+            local_grad_buffer = grad_region.local
+            remote_grad_ptrs = grad_region.remote_ptrs
+        else:
+            local_grad_buffer = torch.empty(
+                0, dtype=torch.float32, device=torch.device("cuda", self.device)
+            )
+            remote_grad_ptrs = torch.empty(0, dtype=torch.int64)
+
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -154,8 +254,23 @@ class Manager:
             tuning.weight_sync_relay_min_replicas,
             tuning.weight_sync_relay_max_relays,
             tuning.weight_sync_relay_min_fanout_gain,
+            weight_region.local,
+            local_scale_buffer,
+            ready_region.storage,
+            local_grad_buffer,
+            weight_region.remote_ptrs,
+            remote_scale_ptrs,
+            remote_grad_ptrs,
+            ready_region.remote_ptrs,
         )
         assert self.runtime.is_available()
+        retain_runtime()
+
+        # Symmetric rendezvous makes the mapped addresses visible, but the C++
+        # constructor also initializes local relay flags and placement state.
+        # Keep the old constructor-level readiness guarantee without a
+        # communication-library-specific barrier.
+        dist.barrier(group=self.group)
 
         # Placement maps are device-resident. Tests and diagnostics should reduce
         # metrics on GPU and only materialize small scalar summaries for printing.
@@ -176,6 +291,12 @@ class Manager:
         )
         self._rank_quota_prefix: torch.Tensor = (
             self.runtime.get_rank_quota_prefix_tensor()
+        )
+        self._local_expert_loads: torch.Tensor = (
+            self.runtime.get_local_expert_loads_tensor()
+        )
+        self._expert_loads_per_rank: torch.Tensor = (
+            self.runtime.get_expert_loads_per_rank_tensor()
         )
         # Full buffers keep the original contiguous expert layout for backward
         # compatibility. The fc1/fc2 tensors below are strided views into these
@@ -299,12 +420,60 @@ class Manager:
         return self._rank_quota_prefix[layer_id]
 
     def destroy(self):
-        assert self.explicitly_destroy
+        """Collectively release buffers before destroying the EP process group.
 
-        self._load_profiler.close()
+        Outstanding CUDA graphs and user-held buffer aliases must be released
+        first. Calling this method more than once is harmless.
+        """
+        if self.runtime is None:
+            return
+
+        if hasattr(self, "_load_profiler"):
+            self._load_profiler.close()
         if self.runtime is not None:
+            # Teardown is collective for symmetric mappings.  First drain all
+            # local streams, then make every EP rank reach a handle barrier,
+            # and wait for that barrier before C++ drops its peer pointers.
+            torch.cuda.synchronize(device=self.device)
+            self._symmetric_lifetime_barrier(
+                torch.cuda.current_stream(device=self.device),
+                self._weight_lifetime_barrier_handle,
+                channel=2,
+            )
+            torch.cuda.synchronize(device=self.device)
             self.runtime.destroy()
         self.runtime = None
+        # ``get_*_tensor`` returns aliases of the external symmetric
+        # allocations, so the Python-side views keep their allocator handles
+        # alive even after C++ has dropped its own Tensor references.  Release
+        # every such alias before clearing the owning regions; otherwise the
+        # NCCL Symmetric Memory destructor can run after the process group has
+        # already been torn down and report ``ncclCommWindowDeregister``
+        # errors.
+        self.local_replica_weight_buffer = None
+        self.local_replica_fc1_weight_buffer = None
+        self.local_replica_fc2_weight_buffer = None
+        self.local_replica_weight_scale_buffer_raw = None
+        self.local_replica_fc1_weight_scale_buffer = None
+        self.local_replica_fc2_weight_scale_buffer = None
+        self.local_replica_grad_buffer = None
+        self.local_replica_fc1_grad_buffer = None
+        self.local_replica_fc2_grad_buffer = None
+        # Drop the Python Symmetric Memory handles only after C++ has released
+        # all local tensor views and asynchronous kernels have been synchronized.
+        self._symm_regions.clear()
+        self._weight_lifetime_barrier_handle = None
+        self._grad_lifetime_barrier_handle = None
+        release_runtime()
+
+    def __del__(self):
+        # Preserve automatic cleanup for the default lifetime mode. Explicit
+        # collective destroy() before process-group shutdown is recommended.
+        if (
+            not getattr(self, "explicitly_destroy", True)
+            and getattr(self, "runtime", None) is not None
+        ):
+            self.destroy()
 
     def allocate_microbatch_slot(self, real_layer_id: int) -> int:
         """Allocate the next virtual layer ID for this real layer.
@@ -432,6 +601,7 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
+        use_current_stream: bool = False,
     ):
         """Aggregate replica gradients to masters.
 
@@ -439,8 +609,15 @@ class Manager:
             layer_id: Virtual layer ID (encodes both real layer and micro-batch
                 slot).  Used for placement map lookup in C++.  Master pointer
                 pools are looked up by the real layer ID derived from this.
+            use_current_stream: Launch task construction, cross-PE barriers, and
+                gradient reduction on the caller's current CUDA stream instead of
+                UltraEP's private communication stream.  Existing callers retain
+                the private-stream behavior by default.
 
         Notes:
+            This is collective within each NVLink domain, including ranks with
+            no local tasks. Completion covers remote reads and buffer clearing;
+            wait on the returned event before reuse when async_finish=True.
             The grad-reduce SM budget is controlled globally via the
             ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
             Set ``ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1`` to use the deterministic
@@ -452,13 +629,31 @@ class Manager:
             self.local_master_fc1_grad_ptr_pool[real_lid] is not None
             and self.local_master_fc2_grad_ptr_pool[real_lid] is not None
         )
-        event = self.runtime.grad_reduce(
-            layer_id,
-            self.local_master_fc1_grad_ptr_pool[real_lid],
-            self.local_master_fc2_grad_ptr_pool[real_lid],
-            getattr(previous_event, "event", None),
-            async_finish,
+        launch_stream = (
+            torch.cuda.current_stream(device=self.device)
+            if use_current_stream
+            else self.get_comm_stream()
         )
+        dependency = (
+            previous_event
+            if previous_event is not None and previous_event.event is not None
+            else EventHandle(_C.EventHandle())
+        )
+        with torch.cuda.stream(launch_stream):
+            self._begin_buffer_access(dependency, self._grad_lifetime_barrier_handle)
+            self.runtime.grad_reduce(
+                layer_id,
+                self.local_master_fc1_grad_ptr_pool[real_lid],
+                self.local_master_fc2_grad_ptr_pool[real_lid],
+                None,
+                True,
+                True,
+            )
+            self._grad_lifetime_barrier_handle.barrier(channel=1)
+            event = _C.EventHandle()
+        if not async_finish:
+            event.current_stream_wait()
+            return EventHandle()
         return EventHandle(event)
 
     def weight_sync(
@@ -467,41 +662,55 @@ class Manager:
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
     ):
+        """Collectively copy master weights to replicas within each NVLink domain.
+
+        All ranks, including those with no local tasks, must call in the same
+        order. Completion covers incoming peer writes and protects reuse of
+        the shared replica buffers. In asynchronous mode the caller must wait
+        on the returned event before accessing the buffers again.
         """
-        Synchronize master weights to replicas.
-
-        The runtime derives a deterministic communication plan from the current
-        placement. Mild cases stay on the flat direct fan-out path; extreme hot
-        masters may use a staged relay plan to reduce source-side bottlenecks.
-
-        Args:
-            layer_id: Virtual layer ID.  Used for placement map lookup in C++.
-                Master pointer pools are looked up by the derived real layer ID.
-            previous_event: Optional event to wait for before starting.
-            async_finish: If True, return immediately with an event handle.
-
-        Returns:
-            EventHandle if async_finish=True, else None.
-        """
-        assert layer_id < self.num_alloc_layers
+        assert 0 <= layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
-        assert (
-            self.local_master_fc1_weight_ptr_pool[real_lid] is not None
-            and self.local_master_fc2_weight_ptr_pool[real_lid] is not None
-            and self.local_master_fc1_weight_scale_ptr_pool[real_lid] is not None
-            and self.local_master_fc2_weight_scale_ptr_pool[real_lid] is not None
-        )
+        assert self.local_master_fc1_weight_ptr_pool[real_lid] is not None
+        assert self.local_master_fc2_weight_ptr_pool[real_lid] is not None
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
-            event = self.runtime.weight_sync(
-                layer_id,
-                self.local_master_fc1_weight_ptr_pool[real_lid],
-                self.local_master_fc2_weight_ptr_pool[real_lid],
-                self.local_master_fc1_weight_scale_ptr_pool[real_lid],
-                self.local_master_fc2_weight_scale_ptr_pool[real_lid],
-                getattr(previous_event, "event", None),
-                async_finish,
+            comm_stream = self.get_comm_stream()
+            # Capture the caller dependency before entering the communication stream.
+            dependency = (
+                previous_event
+                if previous_event is not None and previous_event.event is not None
+                else EventHandle(_C.EventHandle())
             )
+            with torch.cuda.stream(comm_stream):
+                self._begin_buffer_access(dependency, self._weight_lifetime_barrier_handle)
+                self.runtime.weight_sync(
+                    layer_id,
+                    self.local_master_fc1_weight_ptr_pool[real_lid],
+                    self.local_master_fc2_weight_ptr_pool[real_lid],
+                    self.local_master_fc1_weight_scale_ptr_pool[real_lid],
+                    self.local_master_fc2_weight_scale_ptr_pool[real_lid],
+                    _C.EventHandle(),
+                    True,
+                )
+                self._weight_lifetime_barrier_handle.barrier(channel=1)
+                event = _C.EventHandle()
+            if not async_finish:
+                event.current_stream_wait()
+                return EventHandle()
             return EventHandle(event)
+
+    @staticmethod
+    def _begin_buffer_access(previous_event, handle):
+        if previous_event is not None and previous_event.event is not None:
+            previous_event.current_stream_wait()
+        # Producer completion / previous consumers must be visible to every
+        # peer before any kernel can read or overwrite a mapped buffer.
+        handle.barrier(channel=0)
+
+    @staticmethod
+    def _symmetric_lifetime_barrier(stream, handle, *, channel):
+        with torch.cuda.stream(stream):
+            handle.barrier(channel=channel)
 
     def set_weight_sync_plan_mode(self, plan_mode: str):
         normalized = plan_mode.lower().replace("_", "")
@@ -542,20 +751,46 @@ class Manager:
             routing_map: [num_tokens, num_global_logical_experts] bool tensor, logical routing map.
         """
         assert layer_id < self.num_alloc_layers
+        routing_map = routing_map.contiguous()
+        comm_stream = self.get_comm_stream()
+        compute_stream = torch.cuda.current_stream(device=self.device)
+        if compute_stream.stream_id != comm_stream.stream_id:
+            comm_stream.wait_stream(compute_stream)
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
-            self.runtime.update_placement(layer_id, routing_map)
-        self._load_profiler.stage_pre(
-            layer_id,
-            self._real_layer_id(layer_id),
-            self.runtime.get_global_logical_expert_loads_tensor(),
-        )
+            with torch.cuda.stream(comm_stream):
+                self.runtime.compute_local_loads(routing_map)
+                # ``contiguous()`` may have created a temporary tensor. Keep
+                # its storage alive until the communication stream consumes it.
+                routing_map.record_stream(comm_stream)
+                if self.legacy_placement:
+                    global_loads = self.runtime.get_global_logical_expert_loads_tensor()
+                    global_loads.copy_(self._local_expert_loads)
+                    dist.all_reduce(global_loads, group=self.group, async_op=False)
+                    self.runtime.solve_placement_legacy(layer_id, global_loads)
+                else:
+                    dist.all_gather_into_tensor(
+                        self._expert_loads_per_rank,
+                        self._local_expert_loads,
+                        group=self.group,
+                        async_op=False,
+                    )
+                    self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
+                self._load_profiler.stage_pre(
+                    layer_id,
+                    self._real_layer_id(layer_id),
+                    self.runtime.get_global_logical_expert_loads_tensor(),
+                )
         if verify_reduced_loads:
-            global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
-            dist.all_reduce(global_logical_expert_loads, group=self.group)
-            assert torch.equal(
-                global_logical_expert_loads,
-                self.runtime.get_global_logical_expert_loads_tensor(),
-            )
+            compute_stream.wait_stream(comm_stream)
+            with torch.cuda.stream(compute_stream):
+                global_logical_expert_loads = routing_map.sum(
+                    dim=0, dtype=torch.int32
+                )
+                dist.all_reduce(global_logical_expert_loads, group=self.group)
+                assert torch.equal(
+                    global_logical_expert_loads,
+                    self.runtime.get_global_logical_expert_loads_tensor(),
+                )
 
     def update_placement_sparse(
         self,
@@ -563,8 +798,28 @@ class Manager:
         topk_ids: torch.Tensor,
     ):
         assert layer_id < self.num_alloc_layers
-        self.runtime.update_placement_sparse(layer_id, topk_ids)
-        with torch.cuda.stream(self.get_comm_stream()):
+        topk_ids = topk_ids.contiguous()
+        comm_stream = self.get_comm_stream()
+        compute_stream = torch.cuda.current_stream(device=self.device)
+        if compute_stream.stream_id != comm_stream.stream_id:
+            comm_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(comm_stream):
+            self.runtime.compute_local_loads_sparse(topk_ids)
+            topk_ids.record_stream(comm_stream)
+            if self.legacy_placement:
+                global_loads = self.runtime.get_global_logical_expert_loads_tensor()
+                global_loads.copy_(self._local_expert_loads)
+                dist.all_reduce(global_loads, group=self.group, async_op=False)
+                self.runtime.solve_placement_legacy(layer_id, global_loads)
+            else:
+                dist.all_gather_into_tensor(
+                    self._expert_loads_per_rank,
+                    self._local_expert_loads,
+                    group=self.group,
+                    async_op=False,
+                )
+                self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
+        with torch.cuda.stream(comm_stream):
             self._load_profiler.stage_pre(
                 layer_id,
                 self._real_layer_id(layer_id),
@@ -686,6 +941,15 @@ class Manager:
             self.num_alloc_layers,
             self.num_global_logical_experts,
             self.num_ranks,
+        )
+        assert self._local_expert_loads.device == torch.device("cuda", self.device)
+        assert self._expert_loads_per_rank.device == torch.device("cuda", self.device)
+        assert self._local_expert_loads.dtype == torch.int32
+        assert self._expert_loads_per_rank.dtype == torch.int32
+        assert self._local_expert_loads.shape == (self.num_global_logical_experts,)
+        assert self._expert_loads_per_rank.shape == (
+            self.num_ranks,
+            self.num_global_logical_experts,
         )
         assert self.local_replica_weight_buffer.device == torch.device(
             "cuda", self.device

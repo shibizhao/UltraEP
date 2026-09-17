@@ -9,7 +9,8 @@
 #include "launch.cuh"
 #include "ptx.cuh"
 
-// Forward declarations avoid pulling NVSHMEM device headers into this TU.
+// Forward declarations keep the placement kernels independent of any
+// communication-library device headers.
 namespace ultra_ep::runtime {
 extern bool is_runtime_initialized;
 extern int rank_idx;

@@ -51,7 +51,7 @@ __global__ __launch_bounds__(1024) void rmap_local_sum_kernel(const bool* __rest
 void rmap_local_sum(int T,
                     int L,
                     const bool* routing_map_ptr,  // [T, L] bool
-                    int32_t* expert_loads_ptr,    // [L] int32, alloc by nvshmem
+                    int32_t* expert_loads_ptr,    // [L] int32, ordinary CUDA buffer
                     cudaStream_t stream) {
     // 1. Zero out the target array (since we accumulate via atomicAdd)
     // For 128/256 int32s, cudaMemsetAsync has very little overhead on the stream
