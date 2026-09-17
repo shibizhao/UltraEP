@@ -15,6 +15,8 @@ namespace ultra_ep::nvshmem {
 
 inline nvshmem_team_t cpu_rdma_team = NVSHMEM_TEAM_INVALID;
 inline nvshmem_team_config_t cpu_rdma_team_config;
+inline nvshmem_team_t nvl_team = NVSHMEM_TEAM_INVALID;
+inline nvshmem_team_config_t nvl_team_config;
 
 inline std::vector<uint8_t> get_unique_id() {
     nvshmemx_uniqueid_t unique_id;
@@ -55,28 +57,42 @@ inline void barrier(const bool with_cpu_sync = false, const std::optional<cudaSt
         CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
 }
 
+// Replica buffers are accessed through direct NVLink loads/stores. Synchronize
+// the full NVLink domain, which can span multiple hosts on MNNVL systems.
+inline void nvl_sync(cudaStream_t stream) {
+    EP_HOST_ASSERT(nvl_team != NVSHMEM_TEAM_INVALID);
+    EP_HOST_ASSERT(nvshmemx_team_sync_on_stream(nvl_team, stream) == 0);
+}
+
 inline int init(const std::vector<uint8_t>& root_unique_id_val,
                 const int& rank,
                 const int& num_ranks,
-                const int& team_split_stride) {
+                const int& num_nvl_ranks) {
     nvshmemx_uniqueid_t root_unique_id;
     nvshmemx_init_attr_t attr;
     std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
     nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
 
-    // Create sub-RDMA teams
-    if (team_split_stride > 0 and num_ranks > team_split_stride) {
+    EP_HOST_ASSERT(num_nvl_ranks > 0 && num_ranks % num_nvl_ranks == 0);
+
+    // All PEs use the same split arguments: contiguous NVLink domains along x,
+    // and corresponding ranks across domains along y.
+    if (num_ranks > num_nvl_ranks) {
+        EP_HOST_ASSERT(nvl_team == NVSHMEM_TEAM_INVALID);
         EP_HOST_ASSERT(cpu_rdma_team == NVSHMEM_TEAM_INVALID);
-        EP_HOST_ASSERT(num_ranks % team_split_stride == 0);
-        EP_HOST_ASSERT(nvshmem_team_split_strided(NVSHMEM_TEAM_WORLD,
-                                                  rank % team_split_stride,
-                                                  team_split_stride,
-                                                  num_ranks / team_split_stride,
-                                                  &cpu_rdma_team_config,
-                                                  0,
-                                                  &cpu_rdma_team) == 0);
+        EP_HOST_ASSERT(nvshmem_team_split_2d(NVSHMEM_TEAM_WORLD,
+                                             num_nvl_ranks,
+                                             &nvl_team_config,
+                                             0,
+                                             &nvl_team,
+                                             &cpu_rdma_team_config,
+                                             0,
+                                             &cpu_rdma_team) == 0);
+        EP_HOST_ASSERT(nvl_team != NVSHMEM_TEAM_INVALID);
         EP_HOST_ASSERT(cpu_rdma_team != NVSHMEM_TEAM_INVALID);
+    } else {
+        nvl_team = NVSHMEM_TEAM_WORLD;
     }
 
     // Wait all GPUs to get ready
@@ -86,6 +102,10 @@ inline int init(const std::vector<uint8_t>& root_unique_id_val,
 
 inline void finalize() {
     barrier(true);
+    if (nvl_team != NVSHMEM_TEAM_INVALID && nvl_team != NVSHMEM_TEAM_WORLD) {
+        nvshmem_team_destroy(nvl_team);
+    }
+    nvl_team = NVSHMEM_TEAM_INVALID;
     if (cpu_rdma_team != NVSHMEM_TEAM_INVALID) {
         nvshmem_team_destroy(cpu_rdma_team);
         cpu_rdma_team = NVSHMEM_TEAM_INVALID;

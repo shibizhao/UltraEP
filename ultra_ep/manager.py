@@ -441,6 +441,13 @@ class Manager:
                 pools are looked up by the real layer ID derived from this.
 
         Notes:
+            All ranks in an NVLink domain must call this operation in the same
+            order, including ranks with no local reduction tasks. The current
+            stream (or ``previous_event``) must cover local gradient producers.
+            With ``async_finish=True``, wait on the returned event before reading
+            master gradients or reusing replica gradients. Completion includes
+            peer reads and clears of the shared replica buffers.
+
             The grad-reduce SM budget is controlled globally via the
             ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
             Set ``ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1`` to use the deterministic
@@ -473,6 +480,12 @@ class Manager:
         The runtime derives a deterministic communication plan from the current
         placement. Mild cases stay on the flat direct fan-out path; extreme hot
         masters may use a staged relay plan to reduce source-side bottlenecks.
+
+        All ranks in an NVLink domain must call this operation in the same order,
+        including ranks with no outgoing copies. The current stream (or
+        ``previous_event``) must cover weight producers and previous replica
+        consumers. Completion includes incoming peer writes; when asynchronous,
+        wait on the returned event before consuming the replica weights.
 
         Args:
             layer_id: Virtual layer ID.  Used for placement map lookup in C++.

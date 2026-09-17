@@ -1049,6 +1049,10 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
         stream_wait(comm_stream, compute_stream);
     }
 
+    // Local stream waits do not cover peer Wgrad producers. All replica
+    // gradients must be ready before any PE reads and clears them remotely.
+    nvshmem::nvl_sync(comm_stream);
+
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.numel() == num_local_master_experts);
@@ -1082,6 +1086,10 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                              grad_reduce_num_sms_,
                              grad_reduce_deterministic_);
 
+    // A PE with no local tasks may still own replicas consumed by its peers.
+    // Include all remote reads/clears in the completion event before reuse.
+    nvshmem::nvl_sync(comm_stream);
+
     // Wait streams
     if (async) {
         event = EventHandle(comm_stream);
@@ -1106,11 +1114,13 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-        stream_wait(relay_stream, previous_event.value());
     } else {
         stream_wait(comm_stream, compute_stream);
-        stream_wait(relay_stream, compute_stream);
     }
+
+    // Wait until every peer has finished using the previous replica weights
+    // before overwriting them. The relay stream joins through task_build_ready.
+    nvshmem::nvl_sync(comm_stream);
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.dtype() == torch::kInt64);
@@ -1199,6 +1209,10 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     if (launched_stage2) {
         stream_wait(comm_stream, relay_stream);
     }
+
+    // Local sends (including relays) completing does not imply that incoming
+    // weights are ready. Order peer writes before consumers and the result event.
+    nvshmem::nvl_sync(comm_stream);
 
     // Wait streams
     if (async) {

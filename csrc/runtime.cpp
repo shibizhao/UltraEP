@@ -32,7 +32,7 @@ void init_runtime(const int& rank_idx_,
                   const pybind11::bytes& root_unique_id) {
     std::string root_unique_id_str = root_unique_id;
     std::vector<uint8_t> root_unique_id_bytes(root_unique_id_str.begin(), root_unique_id_str.end());
-    EP_HOST_ASSERT(rank_idx_ == nvshmem::init(root_unique_id_bytes, rank_idx_, num_ranks_, 0));
+    EP_HOST_ASSERT(rank_idx_ == nvshmem::init(root_unique_id_bytes, rank_idx_, num_ranks_, max_nvl_peers_));
 
     // Support both nvl and rdma ranks
     num_ranks = num_ranks_;
