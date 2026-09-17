@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace ultra_ep {
 
@@ -631,6 +632,11 @@ void Manager::destroy() {
     // Free contiguous placement buffers (CPU pinned + GPU)
     placement.cleanup();
 
+    // Bound barrier methods retain the symmetric handles too. Release them
+    // before Python frees the owning regions and tears down process groups.
+    weight_lifetime_barrier_ = pybind11::function();
+    grad_lifetime_barrier_ = pybind11::function();
+
     // Ready to destroy
     _available = false;
 }
@@ -969,6 +975,13 @@ void Manager::set_grad_reduce_deterministic(const bool& deterministic, const int
     grad_reduce_num_sms_ = std::min(grad_reduce_num_sms, runtime::num_device_sms);
 }
 
+void Manager::set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier) {
+    EP_HOST_ASSERT(is_available());
+    EP_HOST_ASSERT(!weight_lifetime_barrier_ && !grad_lifetime_barrier_);
+    weight_lifetime_barrier_ = std::move(weight_barrier);
+    grad_lifetime_barrier_ = std::move(grad_barrier);
+}
+
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
@@ -982,6 +995,8 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
     // UltraEP's otherwise-private third stream from the full-layer CUDA graph while
     // preserving the default private-stream behavior for all existing callers.
     const auto launch_stream = use_current_stream ? caller_stream : comm_stream;
+    const c10::cuda::CUDAStreamGuard stream_guard(launch_stream);
+    EP_HOST_ASSERT(grad_lifetime_barrier_);
     std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
@@ -989,6 +1004,8 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
     } else if (launch_stream.id() != caller_stream.id()) {
         stream_wait(launch_stream, caller_stream);
     }
+
+    grad_lifetime_barrier_(0);
 
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.dtype() == torch::kInt64);
@@ -1023,6 +1040,9 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                              grad_reduce_num_sms_,
                              grad_reduce_deterministic_);
 
+    // Completion includes remote reads and clears before shared-buffer reuse.
+    grad_lifetime_barrier_(1);
+
     // Wait streams
     if (async) {
         event = EventHandle(launch_stream);
@@ -1043,13 +1063,17 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     EP_HOST_ASSERT(is_available());
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
+    const c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
+    EP_HOST_ASSERT(weight_lifetime_barrier_);
     std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
-    } else {
+    } else if (comm_stream.id() != compute_stream.id()) {
         stream_wait(comm_stream, compute_stream);
     }
+
+    weight_lifetime_barrier_(0);
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.dtype() == torch::kInt64);
@@ -1101,7 +1125,10 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                           _relay_task_metadata,
                                           _relay_global_tile_counter,
                                           comm_stream);
-    EventHandle task_build_ready(comm_stream);
+    // Only relay mode needs a task-build event and a second-stream dependency.
+    if (enable_relay_stages) {
+        stream_wait(relay_stream, comm_stream);
+    }
 
     kernels::run_weight_sync(_weight_sync_tasks,
                              _task_tile_offsets,
@@ -1118,7 +1145,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                              2);
 
     if (enable_relay_stages) {
-        stream_wait(relay_stream, task_build_ready);
         kernels::run_weight_sync(_relay_weight_sync_tasks,
                                  _relay_task_tile_offsets,
                                  _relay_task_metadata,
@@ -1139,10 +1165,13 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         stream_wait(comm_stream, relay_stream);
     }
 
+    // Record/return a single completion event after incoming writes are ready.
+    weight_lifetime_barrier_(1);
+
     // Wait streams
     if (async) {
         event = EventHandle(comm_stream);
-    } else {
+    } else if (compute_stream.id() != comm_stream.id()) {
         stream_wait(compute_stream, comm_stream);
     }
 

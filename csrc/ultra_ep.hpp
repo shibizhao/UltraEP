@@ -124,6 +124,10 @@ class Manager {
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
     at::cuda::CUDAStream relay_stream;
+    // Cache the bound Torch handle methods without depending on private
+    // Symmetric Memory C++ headers. Pybind entry points keep the GIL held.
+    pybind11::function weight_lifetime_barrier_;
+    pybind11::function grad_lifetime_barrier_;
     // Completion event for the latest placement update / forward-buffer pre-zero.
     // Train mode tracks one slot per layer; inference mode uses slot 0 as the shared buffer.
     std::vector<std::optional<EventHandle>> placement_ready_events_;
@@ -249,6 +253,7 @@ public:
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
+    void set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier);
 
     // Aggregate grad from remote replicas to local master
     // then zero-out replica grad buffers
@@ -410,6 +415,7 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("remote_ready_ptrs_external") = torch::Tensor())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
+        .def("set_lifetime_barriers", &Manager::set_lifetime_barriers)
         .def("compute_local_loads", &Manager::compute_local_loads)
         .def("compute_local_loads_sparse", &Manager::compute_local_loads_sparse)
         .def("solve_placement", &Manager::solve_placement)

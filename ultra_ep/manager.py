@@ -265,6 +265,10 @@ class Manager:
         )
         assert self.runtime.is_available()
         retain_runtime()
+        self.runtime.set_lifetime_barriers(
+            self._weight_lifetime_barrier_handle.barrier,
+            self._grad_lifetime_barrier_handle.barrier,
+        )
 
         # Symmetric rendezvous makes the mapped addresses visible, but the C++
         # constructor also initializes local relay flags and placement state.
@@ -629,31 +633,14 @@ class Manager:
             self.local_master_fc1_grad_ptr_pool[real_lid] is not None
             and self.local_master_fc2_grad_ptr_pool[real_lid] is not None
         )
-        launch_stream = (
-            torch.cuda.current_stream(device=self.device)
-            if use_current_stream
-            else self.get_comm_stream()
+        event = self.runtime.grad_reduce(
+            layer_id,
+            self.local_master_fc1_grad_ptr_pool[real_lid],
+            self.local_master_fc2_grad_ptr_pool[real_lid],
+            getattr(previous_event, "event", None),
+            async_finish,
+            use_current_stream,
         )
-        dependency = (
-            previous_event
-            if previous_event is not None and previous_event.event is not None
-            else EventHandle(_C.EventHandle())
-        )
-        with torch.cuda.stream(launch_stream):
-            self._begin_buffer_access(dependency, self._grad_lifetime_barrier_handle)
-            self.runtime.grad_reduce(
-                layer_id,
-                self.local_master_fc1_grad_ptr_pool[real_lid],
-                self.local_master_fc2_grad_ptr_pool[real_lid],
-                None,
-                True,
-                True,
-            )
-            self._grad_lifetime_barrier_handle.barrier(channel=1)
-            event = _C.EventHandle()
-        if not async_finish:
-            event.current_stream_wait()
-            return EventHandle()
         return EventHandle(event)
 
     def weight_sync(
@@ -674,38 +661,16 @@ class Manager:
         assert self.local_master_fc1_weight_ptr_pool[real_lid] is not None
         assert self.local_master_fc2_weight_ptr_pool[real_lid] is not None
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
-            comm_stream = self.get_comm_stream()
-            # Capture the caller dependency before entering the communication stream.
-            dependency = (
-                previous_event
-                if previous_event is not None and previous_event.event is not None
-                else EventHandle(_C.EventHandle())
+            event = self.runtime.weight_sync(
+                layer_id,
+                self.local_master_fc1_weight_ptr_pool[real_lid],
+                self.local_master_fc2_weight_ptr_pool[real_lid],
+                self.local_master_fc1_weight_scale_ptr_pool[real_lid],
+                self.local_master_fc2_weight_scale_ptr_pool[real_lid],
+                getattr(previous_event, "event", None),
+                async_finish,
             )
-            with torch.cuda.stream(comm_stream):
-                self._begin_buffer_access(dependency, self._weight_lifetime_barrier_handle)
-                self.runtime.weight_sync(
-                    layer_id,
-                    self.local_master_fc1_weight_ptr_pool[real_lid],
-                    self.local_master_fc2_weight_ptr_pool[real_lid],
-                    self.local_master_fc1_weight_scale_ptr_pool[real_lid],
-                    self.local_master_fc2_weight_scale_ptr_pool[real_lid],
-                    _C.EventHandle(),
-                    True,
-                )
-                self._weight_lifetime_barrier_handle.barrier(channel=1)
-                event = _C.EventHandle()
-            if not async_finish:
-                event.current_stream_wait()
-                return EventHandle()
             return EventHandle(event)
-
-    @staticmethod
-    def _begin_buffer_access(previous_event, handle):
-        if previous_event is not None and previous_event.event is not None:
-            previous_event.current_stream_wait()
-        # Producer completion / previous consumers must be visible to every
-        # peer before any kernel can read or overwrite a mapped buffer.
-        handle.barrier(channel=0)
 
     @staticmethod
     def _symmetric_lifetime_barrier(stream, handle, *, channel):

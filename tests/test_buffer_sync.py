@@ -51,7 +51,7 @@ def run_case(manager, weights, grads, args, operation):
     errors = torch.zeros((), dtype=torch.int64, device="cuda")
     manager.local_replica_weight_buffer.fill_(-1)
     manager.local_replica_grad_buffer.zero_()
-    stream = torch.cuda.Stream()
+    stream = manager.get_comm_stream() if args.comm_stream else torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     api_stream = torch.cuda.Stream()
 
@@ -147,6 +147,7 @@ def main():
     parser.add_argument("--non-deterministic", action="store_true")
     parser.add_argument("--previous-event", action="store_true")
     parser.add_argument("--current-stream", action="store_true")
+    parser.add_argument("--comm-stream", action="store_true")
     parser.add_argument(
         "--operation", choices=("both", "weight_sync", "grad_reduce"), default="both"
     )
